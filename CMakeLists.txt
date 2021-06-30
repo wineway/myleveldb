@@ -2,7 +2,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-cmake_minimum_required(VERSION 3.9)
+cmake_minimum_required(VERSION 3.15)
 # Keep the version below in sync with the one in db.h
 project(leveldb VERSION 1.23.0 LANGUAGES C CXX)
 
@@ -17,7 +17,7 @@ endif(NOT CMAKE_C_STANDARD)
 # C++ standard can be overridden when this is used as a sub-project.
 if(NOT CMAKE_CXX_STANDARD)
   # This project requires C++11.
-  set(CMAKE_CXX_STANDARD 11)
+  set(CMAKE_CXX_STANDARD 20)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   set(CMAKE_CXX_EXTENSIONS OFF)
 endif(NOT CMAKE_CXX_STANDARD)
@@ -70,6 +70,7 @@ else(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   # Disable C++ exceptions.
   string(REGEX REPLACE "-fexceptions" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines")
 
   # Disable RTTI.
   string(REGEX REPLACE "-frtti" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
@@ -235,6 +236,31 @@ target_include_directories(leveldb
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+
+add_library(uring "")
+add_custom_command(TARGET uring
+        PRE_BUILD
+        COMMAND bash ${PROJECT_SOURCE_DIR}/third_party/liburing/configure
+        )
+#set_target_properties(uring PROPERTIES LINK_DEPENDS third_party/liburing/src/liburing.map)
+target_sources(uring
+        PRIVATE
+        "third_party/liburing/src/queue.c"
+        "third_party/liburing/src/register.c"
+        "third_party/liburing/src/setup.c"
+        "third_party/liburing/src/syscall.c"
+        "third_party/liburing/src/syscall.h")
+
+target_include_directories(uring PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/liburing/src/include>
+        $<INSTALL_INTERFACE:include>)
+
+
+add_executable(mytest benchmarks/aaaa.h benchmarks/aaaa.cpp)
+target_link_libraries(mytest uring)
+target_link_libraries(mytest leveldb)
+
+target_link_libraries(leveldb uring)
 
 set_target_properties(leveldb
   PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
@@ -445,7 +471,7 @@ int main() {
 endif(LEVELDB_BUILD_BENCHMARKS)
 
 if(LEVELDB_INSTALL)
-  install(TARGETS leveldb
+  install(TARGETS leveldb uring
     EXPORT leveldbTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
