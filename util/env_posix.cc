@@ -812,7 +812,6 @@ void PosixEnv::BackgroundThreadMain() {
     auto background_work_function = background_work_queue_.front().function;
     void* background_work_arg = background_work_queue_.front().arg;
     background_work_queue_.pop();
-
     background_work_mutex_.Unlock();
     background_work_function(background_work_arg);
   }
@@ -837,7 +836,7 @@ class SingletonEnv {
  public:
   SingletonEnv() {
 #if !defined(NDEBUG)
-    env_initialized_.store(true, std::memory_order::memory_order_relaxed);
+    env_initialized_.store(true, std::memory_order_relaxed);
 #endif  // !defined(NDEBUG)
     static_assert(sizeof(env_storage_) >= sizeof(EnvType),
                   "env_storage_ will not fit the Env");
@@ -854,7 +853,7 @@ class SingletonEnv {
 
   static void AssertEnvNotInitialized() {
 #if !defined(NDEBUG)
-    assert(!env_initialized_.load(std::memory_order::memory_order_relaxed));
+    assert(!env_initialized_.load(std::memory_order_relaxed));
 #endif  // !defined(NDEBUG)
   }
 

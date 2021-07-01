@@ -20,6 +20,7 @@
 #include "util/mutexlock.h"
 #include "util/random.h"
 #include "util/testutil.h"
+#include <experimental/coroutine>
 
 // Comma-separated list of operations to run in the specified order
 //   Actual benchmarks:
@@ -927,7 +928,7 @@ class Benchmark {
     thread->stats.AddMessage(msg);
   }
 
-  void DoDelete(ThreadState* thread, bool seq) {
+  Status DoDelete(ThreadState* thread, bool seq) {
     RandomGenerator gen;
     WriteBatch batch;
     Status s;
@@ -940,6 +941,7 @@ class Benchmark {
         batch.Delete(key.slice());
         thread->stats.FinishedSingleOp();
       }
+      co_await 1;
       s = db_->Write(write_options_, &batch);
       if (!s.ok()) {
         std::fprintf(stderr, "del error: %s\n", s.ToString().c_str());

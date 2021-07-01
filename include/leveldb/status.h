@@ -18,12 +18,30 @@
 
 #include "leveldb/export.h"
 #include "leveldb/slice.h"
-
+#include <experimental/coroutine>
 namespace leveldb {
+
 
 class LEVELDB_EXPORT Status {
  public:
+  struct statusPromise {
+    char* state_;
+    void unhandled_exception() {}
+    std::experimental::suspend_always initial_suspend() { return {}; }
+    std::experimental::suspend_never final_suspend() { return {}; }
+    Status get_return_object() {
+      return std::experimental::coroutine_handle<statusPromise>::from_promise(*this);
+    }
+    void return_value(char* state) { state_ = state; }
+  };
+  using promise_type = statusPromise;
+
   // Create a success status.
+  std::experimental::coroutine_handle<statusPromise> h_;
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "google-explicit-constructor"
+  Status(std::experimental::coroutine_handle<statusPromise> h): h_(h), state_(nullptr) {};
+#pragma clang diagnostic pop
   Status() noexcept : state_(nullptr) {}
   ~Status() { delete[] state_; }
 
@@ -54,7 +72,7 @@ class LEVELDB_EXPORT Status {
   }
 
   // Returns true iff the status indicates success.
-  bool ok() const { return (state_ == nullptr); }
+  bool ok() const { return (h_.promise().state_ == nullptr); }
 
   // Returns true iff the status indicates a NotFound error.
   bool IsNotFound() const { return code() == kNotFound; }
