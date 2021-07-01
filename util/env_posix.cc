@@ -2,16 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include <dirent.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <sys/mman.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
-
+#include "port/port.h"
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -19,17 +10,30 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
+#ifdef USE_IO_URING
+#include <liburing.h>
+#endif
 #include <limits>
+#include <pthread.h>
 #include <queue>
 #include <set>
 #include <string>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <thread>
 #include <type_traits>
+#include <unistd.h>
 #include <utility>
 
 #include "leveldb/env.h"
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
+
 #include "port/port.h"
 #include "port/thread_annotations.h"
 #include "util/env_posix_test_helper.h"
@@ -105,6 +109,53 @@ class Limiter {
 //
 // Instances of this class are thread-friendly but not thread-safe, as required
 // by the SequentialFile API.
+
+
+#ifdef USE_IO_URING
+class UringSequentialFile : public SequentialFile {
+ public:
+  UringSequentialFile(std::string basicString, int i, io_uring* pUring)
+      : filename_(std::move(basicString)), fd_(i), ring(pUring), offset_(0) {}
+  ~UringSequentialFile() override { close(fd_); }
+  Status Read(size_t n, Slice* result, char* scratch) override {
+    auto sqe = io_uring_get_sqe(ring);
+
+    size_t read_size = n;
+    iov->iov_base = scratch;
+    iov->iov_len = n;
+    io_uring_prep_readv(sqe, fd_, iov, 1, offset_);
+    sqe->flags = sqe->flags;
+
+    int ret = io_uring_submit(ring);
+    if (ret < 0) {
+      fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+    }
+
+    io_uring_cqe* cqe;
+
+    int errn = io_uring_wait_cqe(ring, &cqe);
+
+    if (cqe->res > 0) {
+      offset_ += read_size = cqe->res;
+    }
+
+    *result = Slice(scratch, read_size);
+    return Status::OK();
+  }
+
+  Status Skip(uint64_t n) override {
+    offset_ += n;
+    return Status::OK();
+  }
+
+ private:
+  const int fd_;
+  unsigned offset_;
+  const std::string filename_;
+  io_uring* ring;
+  iovec* iov = new iovec{};
+};
+#else
 class PosixSequentialFile final : public SequentialFile {
  public:
   PosixSequentialFile(std::string filename, int fd)
@@ -139,12 +190,90 @@ class PosixSequentialFile final : public SequentialFile {
   const int fd_;
   const std::string filename_;
 };
-
+#endif
 // Implements random read access in a file using pread().
 //
 // Instances of this class are thread-safe, as required by the RandomAccessFile
 // API. Instances are immutable and Read() only calls thread-safe library
 // functions.
+#ifdef USE_IO_URING
+class UringRandomAccessFile final : public RandomAccessFile {
+ public:
+  UringRandomAccessFile(std::string filename, int fd, Limiter* fd_limiter,
+                        io_uring* ring)
+      : has_permanent_fd_(fd_limiter->Acquire()),
+        fd_(has_permanent_fd_ ? fd : -1),
+        fd_limiter_(fd_limiter),
+        filename_(std::move(filename)),
+        ring_(ring) {
+    if (!has_permanent_fd_) {
+      assert(fd_ == -1);
+      ::close(fd);  // The file will be opened on every read.
+    }
+  }
+
+  ~UringRandomAccessFile() override {
+    if (has_permanent_fd_) {
+      assert(fd_ != -1);
+      ::close(fd_);
+      fd_limiter_->Release();
+    }
+  }
+
+  Status Read(uint64_t offset, size_t n, Slice* result,
+              char* scratch) const override {
+    int fd = fd_;
+    if (!has_permanent_fd_) {
+      fd = ::open(filename_.c_str(), O_RDONLY | kOpenBaseFlags);
+      if (fd < 0) {
+        return PosixError(filename_, errno);
+      }
+    }
+
+    auto sqe = io_uring_get_sqe(ring_);
+
+    size_t read_size = n;
+    iov->iov_base = scratch;
+    iov->iov_len = n;
+    io_uring_prep_readv(sqe, fd, iov, 1, offset);
+
+    int ret = io_uring_submit(ring_);
+    if (ret < 0) {
+      fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+    }
+
+    io_uring_cqe* cqe;
+
+    int errn = io_uring_wait_cqe(ring_, &cqe);
+    unsigned int head = *ring_->cq.khead;
+    unsigned int tail = *ring_->cq.ktail;
+    unsigned f = cqe->user_data;
+    int g = cqe->res;
+
+    if (errn) {
+      fprintf(stderr, "io_uring_consume: %s\n", strerror(-errn));
+    }
+    io_uring_cqe_seen(ring_, cqe);
+    *result = Slice(scratch, read_size);
+
+    if (!has_permanent_fd_) {
+      // Close the temporary file descriptor opened earlier.
+      assert(fd != fd_);
+      ::close(fd);
+    }
+
+    return Status::OK();
+  }
+
+ private:
+  const bool has_permanent_fd_;  // If false, the file is opened on every read.
+  const int fd_;                 // -1 if has_permanent_fd_ is false.
+  Limiter* const fd_limiter_;
+  iovec* iov = new iovec;
+  io_uring* ring_;
+  const std::string filename_;
+};
+#else
 class PosixRandomAccessFile final : public RandomAccessFile {
  public:
   // The new instance takes ownership of |fd|. |fd_limiter| must outlive this
@@ -202,11 +331,6 @@ class PosixRandomAccessFile final : public RandomAccessFile {
   const std::string filename_;
 };
 
-// Implements random read access in a file using mmap().
-//
-// Instances of this class are thread-safe, as required by the RandomAccessFile
-// API. Instances are immutable and Read() only calls thread-safe library
-// functions.
 class PosixMmapReadableFile final : public RandomAccessFile {
  public:
   // mmap_base[0, length-1] points to the memory-mapped contents of the file. It
@@ -245,7 +369,108 @@ class PosixMmapReadableFile final : public RandomAccessFile {
   Limiter* const mmap_limiter_;
   const std::string filename_;
 };
+#endif
+// Implements random read access in a file using mmap().
+//
+// Instances of this class are thread-safe, as required by the RandomAccessFile
+// API. Instances are immutable and Read() only calls thread-safe library
+// functions.
 
+#ifdef USE_IO_URING
+class UringWritableFile final : public WritableFile {
+ public:
+  UringWritableFile(std::string filename, int fd, io_uring* ring)
+  : pos_(0),
+  fd_(fd),
+  is_manifest_(IsManifest(filename)),
+  filename_(std::move(filename)),
+  dirname_(Dirname(filename_)),
+  ring_(ring) {}
+
+  ~UringWritableFile() override {
+    if (fd_ >= 0) {
+      // Ignoring any potential errors
+      ::close(fd_);
+    }
+  }
+
+  Status Append(const Slice& data) override {
+    auto sqe = io_uring_get_sqe(ring_);
+
+    iov->iov_base = static_cast<void*>(const_cast<char*>(data.data()));
+    iov->iov_len = data.size();
+    io_uring_prep_writev(sqe, fd_, iov, 1, 0);
+    sqe->flags = sqe->flags;
+
+    int ret = io_uring_submit(ring_);
+    if (ret < 0) {
+      fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+    }
+
+    io_uring_cqe* cqe;
+
+    int errn = io_uring_wait_cqe(ring_, &cqe);
+
+    return Status();
+
+    return Status::OK();
+  }
+  Status Close() override { return Status::OK(); }
+  Status Flush() override { return Status::OK(); }
+  Status Sync() override { return Status::OK(); }
+
+
+ private:
+
+  // Returns the directory name in a path pointing to a file.
+  //
+  // Returns "." if the path does not contain any directory separator.
+  static std::string Dirname(const std::string& filename) {
+    std::string::size_type separator_pos = filename.rfind('/');
+    if (separator_pos == std::string::npos) {
+      return std::string(".");
+    }
+    // The filename component should not contain a path separator. If it does,
+    // the splitting was done incorrectly.
+    assert(filename.find('/', separator_pos + 1) == std::string::npos);
+
+    return filename.substr(0, separator_pos);
+  }
+
+  // Extracts the file name from a path pointing to a file.
+  //
+  // The returned Slice points to |filename|'s data buffer, so it is only valid
+  // while |filename| is alive and unchanged.
+  static Slice Basename(const std::string& filename) {
+    std::string::size_type separator_pos = filename.rfind('/');
+    if (separator_pos == std::string::npos) {
+      return Slice(filename);
+    }
+    // The filename component should not contain a path separator. If it does,
+    // the splitting was done incorrectly.
+    assert(filename.find('/', separator_pos + 1) == std::string::npos);
+
+    return Slice(filename.data() + separator_pos + 1,
+                 filename.length() - separator_pos - 1);
+  }
+
+  // True if the given file is a manifest file.
+  static bool IsManifest(const std::string& filename) {
+    return Basename(filename).starts_with("MANIFEST");
+  }
+
+  char buf_[kWritableFileBufferSize];
+  size_t pos_;
+  int fd_;
+
+  const bool is_manifest_;  // True if the file's name starts with MANIFEST.
+  const std::string filename_;
+  const std::string dirname_;  // The directory of filename_.
+  io_uring* ring_;
+  iovec* iov = new iovec;
+};
+
+//#else
 class PosixWritableFile final : public WritableFile {
  public:
   PosixWritableFile(std::string filename, int fd)
@@ -435,6 +660,8 @@ class PosixWritableFile final : public WritableFile {
   const std::string filename_;
   const std::string dirname_;  // The directory of filename_.
 };
+#endif
+
 
 int LockOrUnlock(int fd, bool lock) {
   errno = 0;
@@ -505,7 +732,12 @@ class PosixEnv : public Env {
       return PosixError(filename, errno);
     }
 
+#ifdef USE_IO_URING
+    *result = new UringSequentialFile(filename, fd, &ring);
+#else
     *result = new PosixSequentialFile(filename, fd);
+#endif
+
     return Status::OK();
   }
 
@@ -517,9 +749,14 @@ class PosixEnv : public Env {
       return PosixError(filename, errno);
     }
 
+
+#ifdef USE_IO_URING
+      *result = new UringRandomAccessFile(filename, fd, &fd_limiter_, &ring);
+      Status status = Status::OK();
+#else
     if (!mmap_limiter_.Acquire()) {
-      *result = new PosixRandomAccessFile(filename, fd, &fd_limiter_);
-      return Status::OK();
+      *result = new PosixSequentialFile(filename, fd);
+       return Status::OK();
     }
 
     uint64_t file_size;
@@ -539,6 +776,9 @@ class PosixEnv : public Env {
     if (!status.ok()) {
       mmap_limiter_.Release();
     }
+#endif
+
+
     return status;
   }
 
@@ -550,8 +790,12 @@ class PosixEnv : public Env {
       *result = nullptr;
       return PosixError(filename, errno);
     }
-
+#ifdef USE_IO_URING
+    *result = new UringWritableFile(filename, fd, &ring);
+#else
     *result = new PosixWritableFile(filename, fd);
+#endif
+
     return Status::OK();
   }
 
@@ -563,7 +807,9 @@ class PosixEnv : public Env {
       *result = nullptr;
       return PosixError(filename, errno);
     }
-
+#ifdef USE_IO_URING
+#else
+#endif
     *result = new PosixWritableFile(filename, fd);
     return Status::OK();
   }
@@ -737,9 +983,31 @@ class PosixEnv : public Env {
     void* const arg;
   };
 
+#ifdef USE_IO_URING
+  io_uring ring;
+  class UringOption {
+   public:
+    unsigned entries = 1024;
+  };
+  UringOption uringOption;
+
+  int setUp() {
+    int ret;
+    ret = io_uring_queue_init(uringOption.entries, &ring, 0);
+    if (ret < 0) {
+      fprintf(stderr, "queue_init: %s\n", strerror(-ret));
+      return -1;
+    }
+
+    return 0;
+  }
+#endif
+
+
   port::Mutex background_work_mutex_;
   port::CondVar background_work_cv_ GUARDED_BY(background_work_mutex_);
   bool started_background_thread_ GUARDED_BY(background_work_mutex_);
+
 
   std::queue<BackgroundWorkItem> background_work_queue_
       GUARDED_BY(background_work_mutex_);
@@ -776,7 +1044,12 @@ PosixEnv::PosixEnv()
     : background_work_cv_(&background_work_mutex_),
       started_background_thread_(false),
       mmap_limiter_(MaxMmaps()),
-      fd_limiter_(MaxOpenFiles()) {}
+      fd_limiter_(MaxOpenFiles()) {
+#ifdef USE_IO_URING
+  setUp();
+#endif
+
+}
 
 void PosixEnv::Schedule(
     void (*background_work_function)(void* background_work_arg),

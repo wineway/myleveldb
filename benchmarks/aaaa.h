@@ -5,18 +5,21 @@
 #ifndef LEVELDB_AAAA_H
 #define LEVELDB_AAAA_H
 
-#include <stdio.h>
-#include <fcntl.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <iostream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include "liburing.h"
+#include "leveldb/env.h"
 
 #define QD	64
 #define BS	(32*1024)
@@ -246,7 +249,7 @@ static int copy_file(struct io_uring *ring, off_t insize)
   return 0;
 }
 
-int main(int argc, char *argv[])
+int main1(int argc, char *argv[])
 {
   struct io_uring ring;
   off_t insize;
@@ -273,12 +276,51 @@ int main(int argc, char *argv[])
   if (get_file_size(infd, &insize))
     return 1;
 
+  std::cout << "features: " << ring.features << std::endl;
   ret = copy_file(&ring, insize);
 
   close(infd);
   close(outfd);
   io_uring_queue_exit(&ring);
   return ret;
+}
+
+int main(int argc, char *argv[]) {
+  using namespace leveldb;
+  Env* env_ = leveldb::Env::Default();
+  SequentialFile* file;
+  auto stat = env_->NewSequentialFile("/tmp/a", &file);
+  std::cout << stat.ToString() << std::endl;
+  Slice slice;
+  char* chars = new char[1];
+  auto  status = file->Read(1, &slice, chars);
+  std::cout << status.ToString() << chars << std::endl;
+  file->Skip(1);
+  status = file->Read(1, &slice, chars);
+  std::cout << status.ToString() << chars << std::endl;
+
+  std::cout << "--------------------------" << std::endl;
+
+  RandomAccessFile* file1;
+  stat = env_->NewRandomAccessFile("/tmp/a", &file1);
+  std::cout << stat.ToString() << std::endl;
+  status = file1->Read(1, 1, &slice, chars);
+  std::cout << status.ToString() << chars << std::endl;
+  status = file1->Read(2, 1, &slice, chars);
+  std::cout << status.ToString() << chars << std::endl;
+
+  std::cout << "--------------------------" << std::endl;
+
+  WritableFile* file0;
+  stat = env_->NewWritableFile("/tmp/c", &file0);
+  std::cout << stat.ToString() << std::endl;
+  for (int i = 0; i < 3; ++i) {
+    Slice slice1 = Slice("qweqweqweq");
+    file0->Append(slice1);
+  }
+
+  std::cout << status.ToString() << chars << std::endl;
+
 }
 
 
