@@ -14,6 +14,8 @@
 #include <fcntl.h>
 #ifdef USE_IO_URING
 #include <liburing.h>
+#include <sys/eventfd.h>
+#include <linux/time_types.h>
 #endif
 #include <limits>
 #include <pthread.h>
@@ -69,6 +71,127 @@ Status PosixError(const std::string& context, int error_number) {
   }
 }
 
+
+enum Op { WRITE, READ };
+
+enum UserData {
+  EVENT = -2
+};
+
+struct IOTask {
+  IOTask(Op op, int fd, iovec* iov, off_t off)
+      : op(op), fd(fd), iov(iov), off(off) {}
+  Op op;
+  int fd;
+  iovec* iov;
+  off_t off;
+};
+
+
+struct IoContext {
+  std::jthread* thread;
+  std::queue<IOTask*> queue;
+  io_uring ring;
+  std::mutex mutex;
+  std::condition_variable cv_;
+  int event_fd;
+  char* event_buf = new char[8];
+  std::function<void(void*, int)> handler_;
+  __kernel_timespec time{0, 10000};
+
+  IoContext(std::function<void(void*, int)> handler): handler_(std::move(handler)) {}
+
+  ~IoContext() {
+    thread->request_stop();
+    delete thread;
+  }
+
+  int start() {
+    event_fd = ::eventfd(0, 0);
+    if (event_fd < 0) {
+      return -1;
+    }
+    thread = new std::jthread(&IoContext::eventLoop, this);
+    thread->detach();
+  }
+
+  int op(IOTask* iot) {
+    std::lock_guard<std::mutex> l(mutex);
+    queue.push(iot);
+    cv_.notify_one();
+  }
+
+  int write(int fd, iovec* iov, off_t off) {
+    std::lock_guard<std::mutex> l(mutex);
+    auto e = new IOTask(WRITE, fd, iov, off);
+    queue.push(e);
+    cv_.notify_one();
+  }
+
+  int read(int fd, iovec* iov, off_t off) {
+    std::lock_guard<std::mutex> l(mutex);
+    auto e = new IOTask(READ, fd, iov, off);
+    queue.push(e);
+    cv_.notify_one();
+  }
+
+  int wakeUp() {
+    return ::eventfd_write(event_fd, 1);
+  }
+
+ private:
+
+  void handle_event(io_uring_cqe* cqe) {
+    auto sqe = io_uring_get_sqe(&ring);
+    iovec iov{.iov_base = event_buf, .iov_len = 8};
+    io_uring_prep_readv(sqe, event_fd, &iov, 1, 0);
+    io_uring_submit(&ring);
+  }
+
+  void handle_op(io_uring_cqe* cqe) {
+    handler_(reinterpret_cast<void*>(cqe->user_data), cqe->res);
+  }
+
+  void handle_cqe(io_uring_cqe* cqe) {
+    if (cqe->user_data == EVENT) {
+      handle_event(cqe);
+    } else {
+      handle_op(cqe);
+    }
+  }
+
+  [[noreturn]] void eventLoop() {
+    for (;;) {
+
+      io_uring_cqe* cqe;
+      io_uring_wait_cqe_timeout(&ring, &cqe, &time);
+      if (cqe != nullptr) {
+        handle_cqe(cqe);
+        io_uring_cqe_seen(&ring, cqe);
+      }
+
+      std::vector<IOTask*> iot;
+      {
+        std::lock_guard<std::mutex> l(mutex);
+        for(;;) {
+          auto e = queue.front();
+          if (!e) break;
+          iot.push_back(e);
+          queue.pop();
+        }
+      }
+      if (!iot.empty()) {
+        continue;
+      }
+      for (auto task : iot) {
+        auto sqe = io_uring_get_sqe(&ring);
+        io_uring_prep_writev(sqe, task->fd, task->iov, 1, task->off);
+      }
+      io_uring_submit(&ring);
+    }
+  }
+};
+
 // Helper class to limit resource usage to avoid exhaustion.
 // Currently used to limit read-only file descriptors and mmap file usage
 // so that we do not run out of file descriptors or virtual memory, or run into
@@ -118,29 +241,45 @@ class UringSequentialFile : public SequentialFile {
       : filename_(std::move(basicString)), fd_(i), ring(pUring), offset_(0) {}
   ~UringSequentialFile() override { close(fd_); }
   Status Read(size_t n, Slice* result, char* scratch) override {
-    auto sqe = io_uring_get_sqe(ring);
+    size_t read_size = 0;
+    for (;;) {
+      auto sqe = io_uring_get_sqe(ring);
+      iov->iov_base = scratch + read_size;
+      iov->iov_len = n - read_size;
 
-    size_t read_size = n;
-    iov->iov_base = scratch;
-    iov->iov_len = n;
-    io_uring_prep_readv(sqe, fd_, iov, 1, offset_);
-    sqe->flags = sqe->flags;
+      io_uring_prep_readv(sqe, fd_, iov, 1, offset_);
+      port::Mutex mutex;
+      port::CondVar cond(&mutex);
+      sqe->user_data = reinterpret_cast<__u64>(&cond);
 
-    int ret = io_uring_submit(ring);
-    if (ret < 0) {
-      fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+      int ret = io_uring_submit(ring);
+      if (ret < 0) {
+        fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+      }
+
+      io_uring_cqe* cqe;
+
+      io_uring_wait_cqe(ring, &cqe);
+      if (cqe->user_data != sqe->user_data) {
+        reinterpret_cast<port::CondVar*>(cqe->user_data)->Signal();
+        cond.Wait();
+      }
+
+      if (cqe->res < 0) {
+        if (cqe->res == -EINTR || cqe->res == EAGAIN) {
+          continue;
+        }
+        return PosixError(filename_, cqe->res);
+      }
+      offset_ += read_size += cqe->res;
+      int res = cqe->res;
+      io_uring_cqe_seen(ring, cqe);
+
+      if (read_size == n || !res) {
+        *result = Slice(scratch, read_size);
+        return Status::OK();
+      }
     }
-
-    io_uring_cqe* cqe;
-
-    int errn = io_uring_wait_cqe(ring, &cqe);
-
-    if (cqe->res > 0) {
-      offset_ += read_size = cqe->res;
-    }
-
-    *result = Slice(scratch, read_size);
-    return Status::OK();
   }
 
   Status Skip(uint64_t n) override {
@@ -230,39 +369,43 @@ class UringRandomAccessFile final : public RandomAccessFile {
       }
     }
 
-    auto sqe = io_uring_get_sqe(ring_);
+    size_t read_size = 0;
+    for (;;) {
+      auto sqe = io_uring_get_sqe(ring_);
+      iov->iov_base = scratch + read_size;
+      iov->iov_len = n - read_size;
+      io_uring_prep_readv(sqe, fd, iov, 1, offset);
 
-    size_t read_size = n;
-    iov->iov_base = scratch;
-    iov->iov_len = n;
-    io_uring_prep_readv(sqe, fd, iov, 1, offset);
+      int ret = io_uring_submit(ring_);
+      if (ret < 0) {
+        return PosixError(filename_, -ret);
+      }
 
-    int ret = io_uring_submit(ring_);
-    if (ret < 0) {
-      fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+      io_uring_cqe* cqe;
+
+      int err = io_uring_wait_cqe(ring_, &cqe);
+      if (err) {
+        return PosixError(filename_, -err);
+      }
+
+      if (cqe->res < 0) {
+        return PosixError(filename_, -cqe->res);
+      }
+      int res = cqe->res;
+      io_uring_cqe_seen(ring_, cqe);
+      read_size += res;
+      if (read_size == n || !res) {
+        *result = Slice(scratch, read_size);
+
+        if (!has_permanent_fd_) {
+          // Close the temporary file descriptor opened earlier.
+          assert(fd != fd_);
+          ::close(fd);
+        }
+
+        return Status::OK();
+      }
     }
-
-    io_uring_cqe* cqe;
-
-    int errn = io_uring_wait_cqe(ring_, &cqe);
-    unsigned int head = *ring_->cq.khead;
-    unsigned int tail = *ring_->cq.ktail;
-    unsigned f = cqe->user_data;
-    int g = cqe->res;
-
-    if (errn) {
-      fprintf(stderr, "io_uring_consume: %s\n", strerror(-errn));
-    }
-    io_uring_cqe_seen(ring_, cqe);
-    *result = Slice(scratch, read_size);
-
-    if (!has_permanent_fd_) {
-      // Close the temporary file descriptor opened earlier.
-      assert(fd != fd_);
-      ::close(fd);
-    }
-
-    return Status::OK();
   }
 
  private:
@@ -395,33 +538,58 @@ class UringWritableFile final : public WritableFile {
   }
 
   Status Append(const Slice& data) override {
-    auto sqe = io_uring_get_sqe(ring_);
+    int write_size = 0;
+    for (;;) {
+      auto sqe = io_uring_get_sqe(ring_);
 
-    iov->iov_base = static_cast<void*>(const_cast<char*>(data.data()));
-    iov->iov_len = data.size();
-    io_uring_prep_writev(sqe, fd_, iov, 1, 0);
-    sqe->flags = sqe->flags;
+      iov->iov_base =
+          static_cast<void*>(const_cast<char*>(data.data() + write_size));
+      iov->iov_len = data.size() - write_size;
+      io_uring_prep_writev(sqe, fd_, iov, 1, 0);
 
-    int ret = io_uring_submit(ring_);
-    if (ret < 0) {
-      fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+      int ret = io_uring_submit(ring_);
+      if (ret < 0) {
+        fprintf(stderr, "io_uring_submit: %s\n", strerror(-ret));
+      }
+
+      io_uring_cqe* cqe;
+
+      int err = io_uring_wait_cqe(ring_, &cqe);
+
+      if (err) {
+        return PosixError(filename_, -err);
+      }
+
+      int res = cqe->res;
+      std::string s1 = data.ToString();
+
+      if (cqe->res < 0) {
+        return PosixError(filename_, -cqe->res);
+      }
+      io_uring_cqe_seen(ring_, cqe);
+
+      write_size += res;
+      if (write_size == data.size()) return Status::OK();
     }
-
-    io_uring_cqe* cqe;
-
-    int errn = io_uring_wait_cqe(ring_, &cqe);
-
-    return Status();
-
-    return Status::OK();
   }
-  Status Close() override { return Status::OK(); }
+  Status Close() override {
+    Status status;
+    const int close_result = ::close(fd_);
+    if (close_result < 0 && status.ok()) {
+      status = PosixError(filename_, errno);
+    }
+    fd_ = -1;
+    return status;
+  }
   Status Flush() override { return Status::OK(); }
-  Status Sync() override { return Status::OK(); }
-
+  Status Sync() override {
+    if (::fdatasync(fd_) == 0)
+      return Status::OK();
+    else
+      return PosixError(filename_, errno);
+  }
 
  private:
-
   // Returns the directory name in a path pointing to a file.
   //
   // Returns "." if the path does not contain any directory separator.
@@ -733,7 +901,7 @@ class PosixEnv : public Env {
     }
 
 #ifdef USE_IO_URING
-    *result = new UringSequentialFile(filename, fd, &ring);
+    *result = new UringSequentialFile(filename, fd, get_io_uring());
 #else
     *result = new PosixSequentialFile(filename, fd);
 #endif
@@ -751,7 +919,7 @@ class PosixEnv : public Env {
 
 
 #ifdef USE_IO_URING
-      *result = new UringRandomAccessFile(filename, fd, &fd_limiter_, &ring);
+      *result = new UringRandomAccessFile(filename, fd, &fd_limiter_, get_io_uring());
       Status status = Status::OK();
 #else
     if (!mmap_limiter_.Acquire()) {
@@ -784,14 +952,15 @@ class PosixEnv : public Env {
 
   Status NewWritableFile(const std::string& filename,
                          WritableFile** result) override {
-    int fd = ::open(filename.c_str(),
-                    O_TRUNC | O_WRONLY | O_CREAT | kOpenBaseFlags, 0644);
+    int fd =
+        ::open(filename.c_str(),
+               O_TRUNC | O_WRONLY | O_CREAT | O_APPEND | kOpenBaseFlags, 0644);
     if (fd < 0) {
       *result = nullptr;
       return PosixError(filename, errno);
     }
 #ifdef USE_IO_URING
-    *result = new UringWritableFile(filename, fd, &ring);
+    *result = new UringWritableFile(filename, fd, get_io_uring());
 #else
     *result = new PosixWritableFile(filename, fd);
 #endif
@@ -984,23 +1153,37 @@ class PosixEnv : public Env {
   };
 
 #ifdef USE_IO_URING
-  io_uring ring;
+//  thread_local io_uring ring;
   class UringOption {
    public:
     unsigned entries = 1024;
   };
-  UringOption uringOption;
+//  static UringOption uringOption;
 
-  int setUp() {
-    int ret;
-    ret = io_uring_queue_init(uringOption.entries, &ring, 0);
-    if (ret < 0) {
-      fprintf(stderr, "queue_init: %s\n", strerror(-ret));
-      return -1;
+  [[nodiscard]] static io_uring* get_io_uring() {
+    thread_local struct io_uring* ring;
+    if (ring == nullptr) {
+      ring = new struct io_uring;
+      int ret;
+      ret = io_uring_queue_init(UringOption().entries, ring, 0);
+      if (ret < 0) {
+        fprintf(stderr, "queue_init: %s\n", strerror(-ret));
+        return nullptr;
+      }
     }
-
-    return 0;
+    return ring;
   }
+
+//  int setUp() {
+//    int ret;
+//    ret = io_uring_queue_init(uringOption.entries, &ring, 0);
+//    if (ret < 0) {
+//      fprintf(stderr, "queue_init: %s\n", strerror(-ret));
+//      return -1;
+//    }
+//
+//    return 0;
+//  }
 #endif
 
 
@@ -1046,7 +1229,7 @@ PosixEnv::PosixEnv()
       mmap_limiter_(MaxMmaps()),
       fd_limiter_(MaxOpenFiles()) {
 #ifdef USE_IO_URING
-  setUp();
+//  setUp();
 #endif
 
 }
@@ -1163,4 +1346,4 @@ Env* Env::Default() {
   return env_container.env();
 }
 
-}  // namespace leveldb
+};  // namespace leveldb
