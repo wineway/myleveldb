@@ -53,7 +53,9 @@ TEST(Issue320, Test) {
   options.create_if_missing = true;
 
   std::string dbpath = testing::TempDir() + "leveldb_issue320_test";
-  ASSERT_LEVELDB_OK(DB::Open(options, dbpath, &db));
+  auto x = DB::Open(options, dbpath, &db);
+  auto s = x.ToString();
+  ASSERT_LEVELDB_OK(x);
 
   uint32_t target_size = 10000;
   uint32_t num_items = 0;

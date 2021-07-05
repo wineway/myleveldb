@@ -256,7 +256,7 @@ target_include_directories(uring PUBLIC
         $<INSTALL_INTERFACE:include>)
 
 
-add_executable(mytest benchmarks/aaaa.h benchmarks/aaaa.cpp)
+add_executable(mytest third_party/liburing/test/eventfd-disable.c)
 target_link_libraries(mytest uring)
 target_link_libraries(mytest leveldb)
 
