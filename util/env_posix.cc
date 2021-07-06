@@ -76,7 +76,7 @@ Status PosixError(const std::string& context, int error_number) {
 }
 
 
-enum Op { WRITE, READ };
+enum Op { WRITE, READ, SYNC };
 
 enum UserData {
   EVENT = -2
@@ -99,19 +99,43 @@ std::ostream& operator <<(std::ostream& os, const IOTask& task) {
 }
 
 
-struct IoContext {
-  std::jthread* thread;
-  std::queue<IOTask*> queue;
-  io_uring ring;
-  std::shared_mutex mutex;
-  int event_fd;
-  std::atomic_bool need_wakeup;
-  uint64_t event_buf = 0;
-  std::function<void(void*, int)> handler_;
-  __kernel_timespec time{0, 10000000};
-  bool fal = false;
+struct Queue {
+  IOTask** arr_;
+  unsigned mask_;
+  unsigned max_;
+  std::atomic<unsigned long> head_;
+  unsigned long tail_;
+  std::atomic<unsigned> count_;
 
-  IoContext(std::function<void(void*, int)> handler): handler_(std::move(handler)) {}
+  Queue(unsigned len): mask_(len - 1), max_(len), head_(0), tail_(0), arr_(new IOTask*[len]), count_(0) {};
+
+  int push(IOTask* e) {
+    unsigned count = count_.fetch_add(1, std::memory_order_acq_rel);
+    if (count >= max_) {
+      count_.fetch_sub(1, std::memory_order_acq_rel);
+      return -1;
+    }
+    unsigned id = head_.fetch_add(1, std::memory_order_acq_rel);
+    std::atomic_exchange_explicit(reinterpret_cast<std::atomic<IOTask*>*>(&arr_[id & mask_]), e, std::memory_order_release);
+    return 1;
+  }
+
+  IOTask* pop() {
+    auto res = std::atomic_exchange_explicit(reinterpret_cast<std::atomic<IOTask*>*>(&arr_[tail_ & mask_]), nullptr, std::memory_order_acquire);
+    if (!res) {
+      return nullptr;
+    }
+    tail_ ++;
+    count_.fetch_sub(1, std::memory_order_acq_rel);
+    return res;
+  }
+};
+
+
+struct IoContext {
+
+
+  IoContext(std::function<void(void*, int)> handler): handler_(std::move(handler)), queue(1024) {}
 
   ~IoContext() {
     thread->request_stop();
@@ -123,7 +147,6 @@ struct IoContext {
       return -1;
     }
     event_fd = eventfd(0, EFD_CLOEXEC);
-//    int res = io_uring_register_eventfd(&ring, event_fd);
     if (event_fd < 0 ) {
       return -1;
     }
@@ -133,10 +156,9 @@ struct IoContext {
   }
 
   int op(IOTask* iot) {
-    std::unique_lock<std::shared_mutex> l(mutex);
-//    static int write = 0; write++; std::cout << "write:" << write << std::endl;
     queue.push(iot);
     wakeUp();
+    return 0;
   }
 
   int wakeUp() {
@@ -145,7 +167,6 @@ struct IoContext {
     }
     static int event = 0;
     return ::eventfd_write(event_fd, event++);
-//    return io_uring_cq_eventfd_toggle(&ring, true);
   }
 
  private:
@@ -170,7 +191,6 @@ struct IoContext {
   }
 
   void handle_cqe(io_uring_cqe* cqe) {
-//    std::cout << "ud: " << cqe->user_data << std::endl;
     if (cqe->user_data == EVENT) {
       handle_event(cqe);
     } else if (cqe->user_data == LIBURING_UDATA_TIMEOUT) {
@@ -189,8 +209,6 @@ struct IoContext {
       unsigned count = 0;
       unsigned head;
       io_uring_for_each_cqe(&ring, head, cqe) {
-//        std::cout<< "{res="<< cqe->res << ", flags=" << cqe->flags << ", user_data="<< cqe->user_data << "}" << std::endl;
-//        static int handled = 0; handled++; std::cout << "handled:" << handled << std::endl;
         handle_cqe(cqe);
         count++;
         io_uring_cqe_seen(&ring, cqe);
@@ -203,17 +221,12 @@ struct IoContext {
           io_uring_cqe_seen(&ring, cqe);
         }
       }
-//      std::cout << "count" << count << std::endl;
-
-//      io_uring_cq_advance(&ring, count);
 
       iot.clear();
       {
-        std::shared_lock<std::shared_mutex> l(mutex);
-        while (!queue.empty()) {
-          auto e = queue.front();
+        IOTask* e;
+        while (e = queue.pop()) {
           iot.push_back(e);
-          queue.pop();
         }
         need_wakeup.store(true, std::memory_order_release);
       }
@@ -228,9 +241,11 @@ struct IoContext {
         }
         if (task->op == WRITE)
           io_uring_prep_writev(sqe, task->fd, task->iov, 1, task->off);
-        else
+        else if (task->op == READ)
           io_uring_prep_readv(sqe, task->fd, task->iov, 1, task->off);
-//        static int sub = 0; sub++; std::cout << "sub:" << sub << std::endl;
+        else {
+          io_uring_prep_fsync(sqe, task->fd, IORING_FSYNC_DATASYNC);
+        }
         sqe->user_data = reinterpret_cast<__u64>(task);
       }
       int sub = io_uring_submit(&ring);
@@ -240,6 +255,14 @@ struct IoContext {
       }
     }
   }
+  std::jthread* thread;
+  Queue queue;
+  io_uring ring;
+  int event_fd;
+  std::atomic_bool need_wakeup;
+  uint64_t event_buf = 0;
+  std::function<void(void*, int)> handler_;
+  __kernel_timespec time{1, 0};
 };
 
 // Helper class to limit resource usage to avoid exhaustion.
@@ -558,10 +581,46 @@ class UringWritableFile final : public WritableFile {
   }
 
   Status Append(const Slice& data) override {
+    size_t write_size = data.size();
+    const char* write_data = data.data();
+
+    // Fit as much as possible into buffer.
+    size_t copy_size = std::min(write_size, kWritableFileBufferSize - pos_);
+    std::memcpy(buf_ + pos_, write_data, copy_size);
+    write_data += copy_size;
+    write_size -= copy_size;
+    pos_ += copy_size;
+    if (write_size == 0) {
+      return Status::OK();
+    }
+
+    // Can't fit in buffer, so need to do at least one write.
+    Status status = FlushBuffer();
+    if (!status.ok()) {
+      return status;
+    }
+
+    // Small writes go to buffer, large writes are written directly.
+    if (write_size < kWritableFileBufferSize) {
+      std::memcpy(buf_, write_data, write_size);
+      pos_ = write_size;
+      return Status::OK();
+    }
+
+    return AppendDirectly(const_cast<char*>(write_data), write_size);
+  }
+
+  Status FlushBuffer() {
+    auto ret = AppendDirectly(buf_, pos_);
+    pos_ = 0;
+    return ret;
+  }
+
+  Status AppendDirectly(char* data, unsigned len) {
     int write_size = 0;
     for (;;) {
-      iov->iov_base = const_cast<char*>(data.data() + write_size);
-      iov->iov_len = data.size() - write_size;
+      iov->iov_base = data + write_size;
+      iov->iov_len = len - write_size;
       std::latch la(1);
       auto task = new IOTask(WRITE, fd_, iov, 0, &la);
       ioc_->op(task);
@@ -572,10 +631,11 @@ class UringWritableFile final : public WritableFile {
         return PosixError(filename_, -res);
       }
       write_size += res;
-      if (data.size() == write_size)
+      if (len == write_size)
         return Status::OK();
     }
   }
+
   Status Close() override {
     Status status;
     const int close_result = ::close(fd_);
@@ -585,12 +645,29 @@ class UringWritableFile final : public WritableFile {
     fd_ = -1;
     return status;
   }
-  Status Flush() override { return Status::OK(); }
+  Status Flush() override { return FlushBuffer(); }
+
+  Status SyncFd(int fd, const std::string& dirname_) {
+    std::latch la(1);
+    auto task = new IOTask(SYNC, fd, nullptr, 0, &la);
+    ioc_->op(task);
+    la.wait();
+    delete task;
+    return Status::OK();
+  }
+
   Status Sync() override {
-    if (::fdatasync(fd_) == 0)
-      return Status::OK();
-    else
-      return PosixError(filename_, errno);
+    Status status = SyncDirIfManifest();
+    if (!status.ok()) {
+      return status;
+    }
+
+    status = FlushBuffer();
+    if (!status.ok()) {
+      return status;
+    }
+
+    return SyncFd(fd_, filename_);
   }
 
  private:
@@ -629,6 +706,23 @@ class UringWritableFile final : public WritableFile {
   // True if the given file is a manifest file.
   static bool IsManifest(const std::string& filename) {
     return Basename(filename).starts_with("MANIFEST");
+  }
+
+
+  Status SyncDirIfManifest() {
+    Status status;
+    if (!is_manifest_) {
+      return status;
+    }
+
+    int fd = ::open(dirname_.c_str(), O_RDONLY | kOpenBaseFlags);
+    if (fd < 0) {
+      status = PosixError(dirname_, errno);
+    } else {
+      status = SyncFd(fd, dirname_);
+      ::close(fd);
+    }
+    return status;
   }
 
   char buf_[kWritableFileBufferSize];
