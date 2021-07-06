@@ -106,7 +106,7 @@ struct IoContext {
   std::shared_mutex mutex;
   int event_fd;
   std::atomic_bool need_wakeup;
-  uint64_t event_buf;
+  uint64_t event_buf = 0;
   std::function<void(void*, int)> handler_;
   __kernel_timespec time{0, 10000000};
   bool fal = false;
@@ -127,10 +127,9 @@ struct IoContext {
     if (event_fd < 0 ) {
       return -1;
     }
-    auto dummy = io_uring_cqe{};
-    handle_event(&dummy);
     thread = new std::jthread(&IoContext::eventLoop, this);
     thread->detach();
+    return 0;
   }
 
   int op(IOTask* iot) {
@@ -152,10 +151,6 @@ struct IoContext {
  private:
 
   void handle_event(io_uring_cqe* cqe) {
-//    std::cout  << "res:" << cqe->res << ", event:" << event_buf << std::endl;
-    static eventfd_t evt;
-//    eventfd_read(event_fd, &evt);
-//    io_uring_cq_eventfd_toggle(&ring, false);
     auto sqe = io_uring_get_sqe(&ring);
     if (sqe == nullptr) {
       std::cout << "get sqe error 206" << std::endl;
@@ -165,10 +160,6 @@ struct IoContext {
     io_uring_prep_readv(sqe, event_fd, &iov, 1, 0);
     sqe->user_data = EVENT;
     int ret = io_uring_submit(&ring);
-
-    static eventfd_t i;
-//    ::eventfd_read(event_fd, &i);
-//    static int i = 9;eventfd_write(event_fd, i++);
     if (ret < 0) {
       std::cout << "ret " << ret << std::endl;
     }
@@ -190,6 +181,8 @@ struct IoContext {
   }
 
   [[noreturn]] void eventLoop() {
+    auto dummy = io_uring_cqe{};
+    handle_event(&dummy);
     std::vector<IOTask*> iot;
     for (;;) {
       io_uring_cqe* cqe;
@@ -1216,7 +1209,10 @@ PosixEnv::PosixEnv()
       ioc(&handle_task),
       fd_limiter_(MaxOpenFiles()) {
 #ifdef USE_IO_URING
-  ioc.start();
+      int res = ioc.start();
+      if (res) {
+        exit(res);
+      }
 #endif
 
 }
