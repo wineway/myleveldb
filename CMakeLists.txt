@@ -237,6 +237,7 @@ target_include_directories(leveldb
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
+if (USE_IO_URING)
 add_library(uring "")
 add_custom_command(TARGET uring
         PRE_BUILD
@@ -251,6 +252,10 @@ target_sources(uring
         "third_party/liburing/src/syscall.c"
         "third_party/liburing/src/syscall.h")
 
+target_sources(leveldb
+        PRIVATE
+        "util/queue.h")
+
 target_include_directories(uring PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/liburing/src/include>
         $<INSTALL_INTERFACE:include>)
@@ -261,6 +266,7 @@ target_include_directories(uring PUBLIC
 #target_link_libraries(mytest leveldb)
 
 target_link_libraries(leveldb uring)
+endif(USE_IO_URING)
 
 set_target_properties(leveldb
   PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})

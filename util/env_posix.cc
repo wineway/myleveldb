@@ -16,17 +16,16 @@
 #include <liburing.h>
 #include <sys/eventfd.h>
 #include <linux/time_types.h>
+#include <util/queue.h>
 #endif
 #include <climits>
 #include <iostream>
 #include <latch>
 #include <limits>
-#include <pthread.h>
 #include <queue>
 #include <set>
 #include <shared_mutex>
 #include <string>
-#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -40,7 +39,6 @@
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
 
-#include "port/port.h"
 #include "port/thread_annotations.h"
 #include "util/env_posix_test_helper.h"
 #include "util/posix_logger.h"
@@ -83,6 +81,9 @@ enum UserData {
 };
 
 struct IOTask {
+  IOTask(Op op, int fd, iovec* iov, off_t off)
+      : op(op), fd(fd), iov(iov), off(off), la_(nullptr) {}
+
   IOTask(Op op, int fd, iovec* iov, off_t off, std::latch* la)
       : op(op), fd(fd), iov(iov), off(off), la_(la) {}
   Op op;
@@ -97,40 +98,6 @@ std::ostream& operator <<(std::ostream& os, const IOTask& task) {
   return os << &task <<"{op=" << task.op << ", fd=" << task.fd << ", iov=" << task.iov->iov_base << ", res=" <<
          task.res << ", off=" << task.off << "}";
 }
-
-
-struct Queue {
-  IOTask** arr_;
-  unsigned mask_;
-  unsigned max_;
-  std::atomic<unsigned long> head_;
-  unsigned long tail_;
-  std::atomic<unsigned> count_;
-
-  Queue(unsigned len): mask_(len - 1), max_(len), head_(0), tail_(0), arr_(new IOTask*[len]), count_(0) {};
-
-  int push(IOTask* e) {
-    unsigned count = count_.fetch_add(1, std::memory_order_acq_rel);
-    if (count >= max_) {
-      count_.fetch_sub(1, std::memory_order_acq_rel);
-      return -1;
-    }
-    unsigned id = head_.fetch_add(1, std::memory_order_acq_rel);
-    std::atomic_exchange_explicit(reinterpret_cast<std::atomic<IOTask*>*>(&arr_[id & mask_]), e, std::memory_order_release);
-    return 1;
-  }
-
-  IOTask* pop() {
-    auto res = std::atomic_exchange_explicit(reinterpret_cast<std::atomic<IOTask*>*>(&arr_[tail_ & mask_]), nullptr, std::memory_order_acquire);
-    if (!res) {
-      return nullptr;
-    }
-    tail_ ++;
-    count_.fetch_sub(1, std::memory_order_acq_rel);
-    return res;
-  }
-};
-
 
 struct IoContext {
 
@@ -161,6 +128,18 @@ struct IoContext {
     return 0;
   }
 
+  int op_sync(IOTask* iot) {
+    std::latch la(1);
+    iot->la_ = &la;
+    queue.push(iot);
+    wakeUp();
+    la.wait();
+    return 0;
+  }
+
+
+
+ private:
   int wakeUp() {
     if (!need_wakeup.exchange(false, std::memory_order_acq_rel)) {
       return 0;
@@ -168,8 +147,6 @@ struct IoContext {
     static int event = 0;
     return ::eventfd_write(event_fd, event++);
   }
-
- private:
 
   void handle_event(io_uring_cqe* cqe) {
     auto sqe = io_uring_get_sqe(&ring);
@@ -256,7 +233,7 @@ struct IoContext {
     }
   }
   std::jthread* thread;
-  Queue queue;
+  Queue<IOTask> queue;
   io_uring ring;
   int event_fd;
   std::atomic_bool need_wakeup;
@@ -318,10 +295,8 @@ class UringSequentialFile : public SequentialFile {
     for (;;) {
       iov->iov_base = scratch + read_size;
       iov->iov_len = n - read_size;
-      std::latch la(1);
-      auto task = new IOTask(READ, fd_, iov, offset_, &la);
-      ioc_->op(task);
-      la.wait();
+      auto task = new IOTask(READ, fd_, iov, offset_);
+      ioc_->op_sync(task);
       int res = task->res;
       delete task;
       if (res < 0) {
@@ -428,10 +403,8 @@ class UringRandomAccessFile final : public RandomAccessFile {
     for (;;) {
       iov.iov_base = scratch + read_size;
       iov.iov_len = n - read_size;
-      std::latch la(1);
-      auto task = new IOTask(READ, fd, &iov, offset, &la);
-      ioc_->op(task);
-      la.wait();
+      auto task = new IOTask(READ, fd, &iov, offset);
+      ioc_->op_sync(task);
       int res = task->res;
       delete task;
       if (res < 0) {
@@ -621,10 +594,8 @@ class UringWritableFile final : public WritableFile {
     for (;;) {
       iov->iov_base = data + write_size;
       iov->iov_len = len - write_size;
-      std::latch la(1);
-      auto task = new IOTask(WRITE, fd_, iov, 0, &la);
-      ioc_->op(task);
-      la.wait();
+      auto task = new IOTask(WRITE, fd_, iov, 0);
+      ioc_->op_sync(task);
       int res = task->res;
       delete task;
       if (res < 0) {
@@ -647,11 +618,9 @@ class UringWritableFile final : public WritableFile {
   }
   Status Flush() override { return FlushBuffer(); }
 
-  Status SyncFd(int fd, const std::string& dirname_) {
-    std::latch la(1);
-    auto task = new IOTask(SYNC, fd, nullptr, 0, &la);
-    ioc_->op(task);
-    la.wait();
+  Status SyncFd(int fd, const std::string& dirname) {
+    auto task = new IOTask(SYNC, fd, nullptr, 0);
+    ioc_->op_sync(task);
     delete task;
     return Status::OK();
   }
